@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GAC Diagnostics</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;background:#0f1218;color:#e8ecf3;margin:0;padding:14px;max-width:680px;margin:0 auto}
+h2{font-size:18px;margin:6px 0 4px}p{color:#9aa4b5;font-size:13px;margin:4px 0 12px}
+input{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2b3445;background:#0a0d12;color:#fff;font-size:15px;margin-bottom:10px}
+button{padding:12px 16px;border:0;border-radius:10px;background:#d7191e;color:#fff;font-weight:700;font-size:14px;width:100%}
+#out{margin-top:14px}.r{padding:9px 10px;border-radius:8px;margin-bottom:6px;font-size:13px;line-height:1.4;word-break:break-word;background:#161b25}
+.ok{border-left:4px solid #1f8a4c}.bad{border-left:4px solid #d7191e;background:#2a1519}.info{border-left:4px solid #5b6b85}
+code{color:#9fd1ff}
+</style></head><body>
+<h2>GAC Fleet Checklists — Diagnostics</h2>
+<p>Open this page from the same website folder as the app. Enter a plate no. / asset code that autofill fails for, then press Run.</p>
+<input id="q" placeholder="Plate no. or asset code (e.g. EG01-0013)" autocomplete="off">
+<button id="go">Run checks</button>
+<div id="out"></div>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script>
+const out=document.getElementById('out');
+const log=(kind,msg)=>{const d=document.createElement('div');d.className='r '+kind;d.innerHTML=msg;out.appendChild(d);};
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const pk=p=>String(p==null?'':p).toUpperCase().replace(/[^A-Z0-9]/g,'');
+function hint(e){
+  const c=(e&&e.code)||''; const m=esc((e&&e.message)||e);
+  if(c.includes('permission-denied')) return `❌ <b>permission-denied</b> — Firestore rules block this. Firebase console → Firestore → Rules: allow read/write on the collections the app uses.`;
+  if(c.includes('resource-exhausted')) return `❌ <b>resource-exhausted</b> — daily free quota (50,000 reads / 20,000 writes) used up. It resets daily, or upgrade to the Blaze plan.`;
+  if(c.includes('failed-precondition')) return `❌ <b>failed-precondition</b> — a Firestore index is needed. Open the browser console, click the link in the error to create it. ${m}`;
+  if(c.includes('unavailable')) return `❌ <b>unavailable</b> — no internet / Firebase unreachable.`;
+  return `❌ <b>${esc(c||'error')}</b> ${m}`;
+}
+async function fileCheck(file,needle,what){
+  try{
+    const r=await fetch(file+'?nocache='+Date.now(),{cache:'no-store'});
+    if(!r.ok){ log('bad',`${file}: HTTP ${r.status} — file is <b>missing on the server</b>. Upload it next to index.html.`); return null; }
+    const t=await r.text(); const ok=t.includes(needle);
+    log(ok?'ok':'bad',ok?`${file}: latest version on server ✔`:`${file}: <b>OLD version</b> on server (${what}). Upload the newest ${file}.`);
+    return t;
+  }catch(e){ log('bad',`${file}: could not be fetched (${esc(e.message)})`); return null; }
+}
+async function run(){
+  out.innerHTML=''; const q=document.getElementById('q').value.trim(), k=pk(q);
+  if(typeof firebase==='undefined'||typeof db==='undefined'){ log('bad','Firebase SDK / firebase-config.js did not load (offline, or firebase-config.js missing).'); return; }
+  log('info','Project: <code>'+esc(firebaseConfig.projectId)+'</code>');
+  log('info','1) Website files');
+  const idx=await fileCheck('index.html','fleet.js','no fleet.js script line');
+  await fileCheck('fleet.js','fleetFind','fleet autofill code missing');
+  await fileCheck('shared.js','fleetAttach','autofill hook missing');
+  await fileCheck('service.js','svcLoadRaw','service alerts code missing');
+  try{ const cached=await (await fetch('index.html')).text(); if(idx&&cached.length!==idx.length) log('bad','This browser shows a <b>cached older index.html</b>. Clear site data (or hard refresh) on the phone.'); else if(idx) log('ok','Browser cache is current ✔'); }catch(e){}
+  log('info','2) Firebase database');
+  for(const c of ['fleet','fleetStatus','serviceAlerts','serviceDefaults','checklists']){
+    try{ const s=await db.collection(c).limit(1).get(); log('ok',`Read <code>${c}</code> ✔ (${s.size?'has data':'empty'})`);
+      if(c==='fleet'&&s.size){ const d=s.docs[0].data(); const miss=['key','plateKey','assetCode','plate','make','model'].filter(f=>!(f in d));
+        log(miss.length?'bad':'ok',miss.length?`Fleet record is missing fields: <b>${miss.join(', ')}</b> — re-import the JSON in Admin → Fleet Master.`:`Fleet record fields look right ✔ (e.g. ${esc(d.assetCode)} / plate ${esc(d.plate)})`); }
+    }catch(e){ log('bad',`<code>${c}</code>: `+hint(e)); }
+  }
+  try{ const c=await db.collection('fleet').count().get(); log('info','Fleet records in database: <b>'+c.data().count+'</b>'); }catch(e){}
+  if(!k){ log('info','Enter a plate / asset code above to test the lookup itself.'); return; }
+  log('info','3) Lookup for <code>'+esc(q)+'</code> (normalised: '+esc(k)+')');
+  try{
+    const a=await db.collection('fleet').where('key','==',k).limit(3).get();
+    const b=await db.collection('fleet').where('plateKey','==',k).limit(3).get();
+    log(a.size?'ok':'info',`Match by asset code: <b>${a.size}</b>`+(a.size?' → '+esc(JSON.stringify(a.docs[0].data())):''));
+    log(b.size?'ok':'info',`Match by plate no.: <b>${b.size}</b>`+(b.size?' → '+esc(JSON.stringify(b.docs[0].data())):''));
+    if(!a.size&&!b.size) log('bad','No match. The plate is not in the fleet master (or typed differently). Check Admin → Fleet Master, search the plate.');
+    else if(!a.size&&b.size>1) log('bad','Several assets share this plate → the app asks for the asset code instead of autofilling.');
+    else log('ok','Autofill should work for this entry ✔');
+    const s1=await db.collection('fleet').where('key','>=',k).where('key','<=',k+'\uf8ff').limit(5).get();
+    const s2=await db.collection('fleet').where('plateKey','>=',k).where('plateKey','<=',k+'\uf8ff').limit(5).get();
+    log('info','Suggestions while typing: '+new Set([...s1.docs,...s2.docs].map(x=>x.id)).size);
+  }catch(e){ log('bad','Lookup query failed: '+hint(e)); }
+}
+document.getElementById('go').onclick=run;
+</script></body></html>
